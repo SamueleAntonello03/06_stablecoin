@@ -1,0 +1,389 @@
+---
+title: "Stablecoins: comparazione di USDC, USDT e DAI"
+author: "Samuele Antonello 162640"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, message = FALSE, warning = FALSE)
+```
+
+Vogliamo confrontare tre importanti stablecoin di Ethereum:
+
+-  USDC (indirizzo dello smart contract: 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48)
+-  USDT (indirizzo dello smart contract: 0xdac17f958d2ee523a2206206994597c13d831ec7)
+-  DAI (indirizzo dello smart contract: 0x6b175474e89094c44da98b954eedeac495271d0f)
+
+Rispondiamo a due domande:
+
+1. Come differiscono le dimensioni dei loro transfer?
+2. Quanto volume di transfer genera ciascuna stablecoin?
+
+Il nostro flusso di lavoro è:
+
+```text
+Ethereum
+   ↓
+Etherscan
+   ↓
+eventi di transfer ERC-20
+   ↓
+R / tidyverse
+   ↓
+dimensioni + volumi dei transfer
+```
+
+Usiamo Etherscan per recuperare gli eventi di transfer ERC-20 già indicizzati. L'endpoint `tokentx` può essere filtrato direttamente per contratto del token, quindi non serve scaricare prima transfer di altri token.
+
+Usiamo il termine *transfer* e non *transazione*: una transazione Ethereum può generare più eventi di transfer ERC-20.
+
+# Preparazione
+
+Carichiamo i pacchetti e leggiamo la chiave API dal file nascosto `.Renviron` (la chiave non va mai scritta in questo documento).
+
+```{r pacchetti}
+library(tidyverse)
+library(httr2)
+library(scales)
+
+api_key = Sys.getenv("ETHERSCAN_API_KEY")
+dir.create("data", showWarnings = FALSE)
+
+# formato per scrivere importi in dollari: es. $1.2M
+usd = label_dollar(scale_cut = cut_short_scale())
+```
+
+I tre contratti sono in una piccola tabella, così ogni passaggio vale per tutte le monete.
+
+```{r contratti}
+stablecoins = tribble(
+  ~stablecoin, ~contratto,
+  "USDC", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "USDT", "0xdac17f958d2ee523a2206206994597c13d831ec7",
+  "DAI",  "0x6b175474e89094c44da98b954eedeac495271d0f"
+)
+```
+
+# Download dei dati
+
+## Scelta del campione
+
+Etherscan restituisce al massimo 10.000 record per richiesta, e le tre monete hanno livelli di attività molto diversi. Se scaricassimo "gli ultimi 10.000 transfer" di ciascuna, coprirebbero periodi di tempo diversi e il confronto dei volumi non avrebbe senso.
+
+Scegliamo quindi **una finestra di blocchi comune** e scarichiamo **tutti** i transfer delle tre monete in quella finestra. Un blocco Ethereum arriva ogni 12 secondi circa, quindi 1000 blocchi sono circa 3 ore. La finestra termina 100 blocchi prima dell'ultimo blocco, per stare lontani da eventuali riorganizzazioni recenti della blockchain.
+
+```{r finestra, eval=FALSE}
+risposta = request("https://api.etherscan.io/v2/api") |>
+  req_url_query(
+    chainid = 1,
+    module = "proxy",
+    action = "eth_blockNumber",
+    apikey = api_key
+  ) |>
+  req_perform() |>
+  resp_body_json(simplifyVector = TRUE)
+
+# il risultato è un numero esadecimale (es. "0x1a2b3c"): lo convertiamo
+ultimo_blocco <- strtoi(substring(risposta$result, 3), base = 16L)
+
+#organizziamo la finestra in modo che sia lunga ll'incirca 3 ore in modo da limitare il numero di richieste a Etherscan, il blocco finale è 100 blocchi prima dell'ultimo, per evitare blocchi recenti che potrebbero essere riorganizzati nella rete.
+finestra = tibble(
+  blocco_iniziale = ultimo_blocco - 1100L, #1000 blocchi x 12 sec = circa 3.3 ore
+  blocco_finale   = ultimo_blocco - 100L #blocchi recenti esclusi
+)
+
+write_csv(finestra, "data/finestra.csv")
+```
+
+```{r leggi-finestra}
+finestra = read_csv("data/finestra.csv")
+finestra
+```
+
+## Funzione di download
+
+Per scaricare i transfer di un token non passiamo un `address`, ma un `contractaddress`: Etherscan restituisce allora tutti i transfer di quel token.
+
+La funzione divide la finestra in pezzi da 100 blocchi, ne scarica uno alla volta e unisce i risultati.Controlliamo `is.character(risposta$result)`: quando non ci sono dati (o c'è un errore) Etherscan restituisce un messaggio di testo invece di una tabella. Se un pezzo arriva a 10.000 righe, potrebbe essere stato troncato e la funzione ci avvisa.
+
+```{r funzione}
+scarica_transfer = function(contratto, blocco_iniziale, blocco_finale,
+                             passo = 100) {
+
+  inizi = seq(blocco_iniziale, blocco_finale, by = passo)
+
+  pezzi = map(inizi, \(inizio) {
+    message("Blocchi da ", inizio)
+    Sys.sleep(0.4)   # il piano gratuito limita le richieste al secondo
+
+    risposta = request("https://api.etherscan.io/v2/api") |>
+      req_url_query(
+        chainid = 1,
+        module = "account",
+        action = "tokentx",
+        contractaddress = contratto,
+        startblock = as.integer(inizio),
+        endblock = as.integer(min(inizio + passo - 1, blocco_finale)),
+        page = 1,
+        offset = 10000,
+        sort = "asc",
+        apikey = api_key
+      ) |>
+      req_perform() |>
+      resp_body_json(simplifyVector = TRUE)
+
+    if (is.character(risposta$result)) {
+      if (grepl("No transactions", risposta$result)) return(tibble())
+      stop("Errore di Etherscan: ", risposta$result)
+    }
+
+    if (nrow(risposta$result) == 10000) {
+      warning("Pezzo di ", passo, " blocchi troncato: riduci 'passo'.")
+    }
+
+    as_tibble(risposta$result)
+  })
+
+  bind_rows(pezzi)
+}
+```
+
+Scarichiamo le tre monete (da eseguire una sola volta: i dati grezzi vengono salvati in `data/`).
+
+```{r download, eval=FALSE}
+for (i in 1:nrow(stablecoins)) {
+  dati <- scarica_transfer(
+    stablecoins$contratto[i],
+    finestra$blocco_iniziale,
+    finestra$blocco_finale
+  )
+  write_csv(dati, paste0("data/", stablecoins$stablecoin[i], ".csv"))
+}
+```
+
+## Pulizia
+
+Etherscan restituisce tutto come testo. Il passaggio fondamentale riguarda l'importo: i valori ERC-20 sono interi espressi nell'unità più piccola del token, e ogni token dichiara quanti decimali usa (`tokenDecimal`):
+
+\[
+\text{importo in dollari} = \frac{\text{value}}{10^{\text{tokenDecimal}}}
+\]
+
+USDC e USDT hanno 6 decimali, DAI ne ha 18. Dimenticare questo passaggio renderebbe gli importi di DAI $10^{12}$ volte più grandi degli altri due coin.
+
+```{r pulizia}
+transfers <- stablecoins$stablecoin |>
+  map(\(moneta) {
+    read_csv(paste0("data/", moneta, ".csv"),
+             col_types = cols(.default = col_character())) |>
+      mutate(stablecoin = moneta)
+  }) |>
+  bind_rows() |>
+  transmute(
+    stablecoin = factor(stablecoin, levels = c("USDC", "USDT", "DAI")),
+    blocco = as.numeric(blockNumber),
+    tempo = as.POSIXct(as.numeric(timeStamp), origin = "1970-01-01", tz = "UTC"),
+    hash,
+    from,
+    to,
+    importo = as.numeric(value) / 10^as.numeric(tokenDecimal)
+  )
+
+glimpse(transfers)
+```
+
+Un rapido controllo: le tre monete devono coprire la stessa finestra, e vediamo quanti transfer hanno importo zero (sono validi, ma non si possono rappresentare su scala logaritmica).
+
+```{r controlli}
+transfers |>
+  group_by(stablecoin) |>
+  summarise(
+    transfer = n(),
+    primo_blocco = min(blocco),
+    ultimo_blocco = max(blocco),
+    importo_zero = sum(importo == 0)
+  )
+```
+
+# Punto 1: 
+*Come differiscono le dimensioni dei transfer?*
+Vediamo alcune statistiche descrittive:
+
+```{r statistiche}
+sintesi = transfers |>
+  filter(importo > 0) |>
+  group_by(stablecoin) |>
+  summarise(
+    n = n(),
+    media = mean(importo),
+    mediana = median(importo),
+    massimo = max(importo)
+  )
+
+sintesi |>
+  mutate(across(media:massimo, \(x) round(x, 2)))
+```
+
+Per tutte le monete la media è molto più alta della mediana: pochi transfer enormi spingono in alto la media.
+
+Osserviamo la distribuzione delle dimensioni relativa a ogni coin, le dimensioni coprono molti ordini di grandezza, quindi usiamo la scala logaritmica.
+
+```{r istogramma, fig.height=7}
+transfers |>
+  filter(importo > 0) |>
+  ggplot(aes(importo, fill = stablecoin)) +
+  geom_histogram(bins = 60, show.legend = FALSE) +
+  scale_x_log10(labels = usd) +
+  facet_wrap(~ stablecoin, ncol = 1, scales = "free_y") +
+  labs(
+    title = "Distribuzione delle dimensioni dei transfer",
+    x = "Importo in dollari (scala logaritmica)",
+    y = "Numero di transfer"
+  ) +
+  theme_minimal()
+```
+
+Osservare le Classi di importo può essere interessante, dunque
+raggruppiamo i transfer in classi di importo e confrontiamo la composizione di ciascuna moneta:
+
+```{r classi}
+transfers <- transfers |>
+  mutate(
+    classe = cut(
+      importo,
+      breaks = c(-Inf, 0, 10, 100, 1e3, 1e4, 1e5, 1e6, Inf),
+      labels = c("zero", "< $10", "$10–100", "$100–1k", "$1k–10k",
+                 "$10k–100k", "$100k–1M", "> $1M"),
+      right = FALSE
+    )
+  )
+
+transfers |>
+  filter(importo > 0) |>
+  ggplot(aes(stablecoin, fill = classe)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(
+    title = "Composizione dei transfer per classe di importo",
+    x = NULL,
+    y = "Quota di transfer",
+    fill = "Importo"
+  ) +
+  theme_minimal()
+```
+
+```{r top1}
+transfers |>
+  filter(importo > 0) |>
+  group_by(stablecoin) |>
+  arrange(desc(importo), .by_group = TRUE) |>
+  summarise(quota_top1 = sum(importo[1:ceiling(0.01 * n())]) / sum(importo)) |>
+  mutate(quota_top1 = label_percent(accuracy = 0.1)(quota_top1))
+```
+Notiamo che nel nostro campione l'1% dei transfer USDC più grandi (per esempio) muove il 90.5% dell'importo totale trasferito in USDC, il restante 99% dei transfer di divide il restante 9.5% del valore, dunque l'importo trasferito (specialmente in USDC ma in maniera simile negli altri due coin) è estremamente concentrato in pochi transfer, questo è coerente con la forte asimmetria osservata nelle distribuzioni (media molto superiore alla mediana).
+
+# Punto 2: 
+*Quanto volume genera ciascuna stablecoin?*
+
+Per *volume* intendiamo la somma degli importi di tutti i transfer nella finestra, in dollari (ogni stablecoin vale circa un dollaro).
+
+Vediamo il volume totale:
+
+Distinguiamo transfer (righe), transazioni (hash distinti: una transazione può contenere più transfer) e indirizzi attivi.
+
+```{r volume}
+volumi <- transfers |>
+  group_by(stablecoin) |>
+  summarise(
+    volume = sum(importo),
+    n_transfer = n(),
+    n_transazioni = n_distinct(hash),
+    mittenti = n_distinct(from),
+    destinatari = n_distinct(to)
+  )
+
+volumi |>
+  mutate(volume = usd(volume))
+```
+
+```{r grafico-volume, fig.height=4}
+ggplot(volumi, aes(stablecoin, volume, fill = stablecoin)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = usd(volume)), vjust = -0.4) +
+  scale_y_continuous(labels = usd, expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Volume totale di transfer nella finestra",
+    x = NULL,
+    y = "Volume (USD)"
+  ) +
+  theme_minimal()
+```
+E' evidente che USDC muove molto più denaro degli altri due coin.
+
+Bisogna però considerare il numero di transfer in relazione volume.
+
+Una moneta può avere molto volume perché ha **molti** transfer, o perché i suoi transfer sono **grandi** (o entrambe le cose). Confrontare la quota sul totale dei transfer con la quota sul volume separa i due effetti.
+
+```{r quote}
+volumi |>
+  transmute(
+    stablecoin,
+    `quota dei transfer` = n_transfer / sum(n_transfer),
+    `quota del volume` = volume / sum(volume)
+  ) |>
+  pivot_longer(-stablecoin, names_to = "misura", values_to = "quota") |>
+  ggplot(aes(misura, quota, fill = stablecoin)) +
+  geom_col() +
+  scale_y_continuous(labels = label_percent()) +
+  labs(
+    title = "Quota delle tre monete: transfer contro volume",
+    x = NULL,
+    y = "Quota sul totale",
+    fill = NULL
+  ) +
+  theme_minimal()
+```
+
+Questo grafico confronta la quota di ciascun coun sul numero di transfer con la sua quota sul volume, notiamo che USDC e USDT hanno un numero di transfer simile ma i volumi sono molto diversi, ne consegue che in media i transfer USDC sono molto più grandi di quelli USDT, che sono numerosi ma di importo ridotto.
+DAI ha pochi transfer ma una quota di volume quasi doppia, segno di importi medi relativamente elevati.
+
+Ha senso dunque domandarsi da quali transfer arriva il volume?
+
+Il volume è una *somma*, e le somme di variabili con code pesanti sono dominate dai valori più grandi. Vediamo quali classi di importo generano il volume e confrontiamo con il grafico per numero di transfer della Domanda 1.
+
+```{r volume-classi}
+transfers |>
+  filter(importo > 0) |>
+  group_by(stablecoin, classe) |>
+  summarise(volume = sum(importo), .groups = "drop") |>
+  ggplot(aes(stablecoin, volume, fill = classe)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(
+    title = "Quali importi generano il volume?",
+    x = NULL,
+    y = "Quota del volume",
+    fill = "Importo"
+  ) +
+  theme_minimal()
+```
+
+# Conclusioni
+
+```{r numeri, include=FALSE}
+max_volume <- volumi |> slice_max(volume, n = 1)
+max_transfer <- volumi |> slice_max(n_transfer, n = 1)
+max_mediana <- sintesi |> slice_max(mediana, n = 1)
+min_mediana <- sintesi |> slice_min(mediana, n = 1)
+```
+
+**Dimensioni.** Nel nostro campione `r max_mediana$stablecoin` ha il transfer tipico (mediano) più grande, circa `r dollar(max_mediana$mediana, accuracy = 1)`, mentre `r min_mediana$stablecoin` ha il più piccolo, circa `r dollar(min_mediana$mediana, accuracy = 1)`. Per tutte le monete la distribuzione è fortemente asimmetrica a destra: la media è molto sopra la mediana e una piccola frazione di transfer muove gran parte del denaro.
+
+**Volume.** `r max_volume$stablecoin` genera il volume maggiore nella finestra (`r usd(max_volume$volume)`), mentre `r max_transfer$stablecoin` ha più transfer (`r comma(max_transfer$n_transfer)`).
+USDT ha tanti transfer piccoli, che fanno pensare a un uso più da "bot", USDC e DAI hanno meno transfer ma più grandi, che fanno pensare a movimenti tra grandi operatori o protocolli.
+
+
+E' necessario considerare che la finestra di analisi di questi coin è limitata, infatti il campione copre solo circa 3 ore di attività: volumi e dimensioni cambiano nell'arco della giornata, della settimana e con gli eventi di mercato, quindi i risultati non sono medie di lungo periodo.
